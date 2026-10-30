@@ -1,0 +1,40 @@
+-- ============================================================
+-- STEP 1: CREATE SCHEMA
+-- ============================================================
+
+CREATE SCHEMA IF NOT EXISTS demo.monitoring;
+
+
+-- ============================================================
+-- STEP 2: CREATE ADF PIPELINE ACTIVITY LOG TABLE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS demo.monitoring.pipeline_activity_log
+(
+    log_id STRING NOT NULL,
+    pipeline_run_id STRING,
+    pipeline_name STRING,
+    activity_run_id STRING,
+    activity_name STRING,
+    activity_type STRING,
+
+    status STRING,
+    error_code STRING,
+    error_message STRING,
+    failure_type STRING,
+
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    duration_seconds BIGINT,
+
+    rows_read BIGINT,
+    rows_written BIGINT,
+
+    input_parameters STRING,
+    output_details STRING,
+
+    trigger_name STRING,
+    logged_at TIMESTAMP
+)
+USING DELTA
+COMMENT 'Centralized logging table for Azure Data Factory pipeline and activity execution';
