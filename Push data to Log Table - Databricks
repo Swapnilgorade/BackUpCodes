@@ -1,0 +1,238 @@
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    TimestampType,
+    LongType
+)
+from datetime import datetime
+import json
+import uuid
+
+
+# ============================================================
+# STEP 1: CONFIGURATION
+# ============================================================
+
+LOG_TABLE = "demo.monitoring.pipeline_activity_log"
+
+
+# ============================================================
+# STEP 2: DEFINE ADF PARAMETERS
+# ============================================================
+
+dbutils.widgets.text("pipeline_run_id", "")
+dbutils.widgets.text("pipeline_name", "")
+dbutils.widgets.text("activity_run_id", "")
+dbutils.widgets.text("activity_name", "")
+dbutils.widgets.text("activity_type", "")
+dbutils.widgets.text("status", "Succeeded")
+
+dbutils.widgets.text("error_code", "")
+dbutils.widgets.text("error_message", "")
+dbutils.widgets.text("failure_type", "")
+
+dbutils.widgets.text("start_time", "")
+dbutils.widgets.text("end_time", "")
+
+dbutils.widgets.text("rows_read", "")
+dbutils.widgets.text("rows_written", "")
+
+dbutils.widgets.text("input_parameters", "{}")
+dbutils.widgets.text("output_details", "{}")
+dbutils.widgets.text("trigger_name", "")
+
+
+# ============================================================
+# STEP 3: READ PARAMETERS
+# ============================================================
+
+def get_widget_value(name):
+    return dbutils.widgets.get(name).strip()
+
+
+pipeline_run_id = get_widget_value("pipeline_run_id")
+pipeline_name = get_widget_value("pipeline_name")
+activity_run_id = get_widget_value("activity_run_id")
+activity_name = get_widget_value("activity_name")
+activity_type = get_widget_value("activity_type")
+
+status = get_widget_value("status").upper()
+
+error_code = get_widget_value("error_code") or None
+error_message = get_widget_value("error_message") or None
+failure_type = get_widget_value("failure_type") or None
+
+start_time = get_widget_value("start_time") or None
+end_time = get_widget_value("end_time") or None
+
+rows_read = get_widget_value("rows_read") or None
+rows_written = get_widget_value("rows_written") or None
+
+input_parameters = get_widget_value("input_parameters") or "{}"
+output_details = get_widget_value("output_details") or "{}"
+
+trigger_name = get_widget_value("trigger_name") or None
+
+
+# ============================================================
+# STEP 4: HELPER FUNCTIONS
+# ============================================================
+
+def parse_timestamp(value):
+    """
+    Convert an ISO timestamp into a Python datetime.
+    Returns None when the value is empty or invalid.
+    """
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).replace(tzinfo=None)
+
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_long(value):
+    """
+    Convert a value to BIGINT-compatible Python integer.
+    Returns None if the value is empty or invalid.
+    """
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_json(value):
+    """
+    Ensure input and output details are valid JSON strings.
+    """
+    try:
+        return json.dumps(json.loads(value), default=str)
+    except (ValueError, TypeError):
+        return json.dumps({"raw_value": value})
+
+
+# ============================================================
+# STEP 5: CALCULATE ACTIVITY DURATION
+# ============================================================
+
+start_dt = parse_timestamp(start_time)
+end_dt = parse_timestamp(end_time)
+
+duration_seconds = None
+
+if start_dt is not None and end_dt is not None:
+    duration_seconds = max(
+        0,
+        int((end_dt - start_dt).total_seconds())
+    )
+
+
+# ============================================================
+# STEP 6: PREPARE LOG RECORD
+# ============================================================
+
+log_record = [(
+    str(uuid.uuid4()),
+    pipeline_run_id or None,
+    pipeline_name or None,
+    activity_run_id or None,
+    activity_name or None,
+    activity_type or None,
+
+    status,
+    error_code,
+    error_message,
+    failure_type,
+
+    start_dt,
+    end_dt,
+    duration_seconds,
+
+    parse_long(rows_read),
+    parse_long(rows_written),
+
+    normalize_json(input_parameters),
+    normalize_json(output_details),
+
+    trigger_name,
+    datetime.utcnow()
+)]
+
+
+# ============================================================
+# STEP 7: DEFINE DATAFRAME SCHEMA
+# ============================================================
+
+schema = StructType([
+    StructField("log_id", StringType(), False),
+    StructField("pipeline_run_id", StringType(), True),
+    StructField("pipeline_name", StringType(), True),
+    StructField("activity_run_id", StringType(), True),
+    StructField("activity_name", StringType(), True),
+    StructField("activity_type", StringType(), True),
+
+    StructField("status", StringType(), False),
+    StructField("error_code", StringType(), True),
+    StructField("error_message", StringType(), True),
+    StructField("failure_type", StringType(), True),
+
+    StructField("start_time", TimestampType(), True),
+    StructField("end_time", TimestampType(), True),
+    StructField("duration_seconds", LongType(), True),
+
+    StructField("rows_read", LongType(), True),
+    StructField("rows_written", LongType(), True),
+
+    StructField("input_parameters", StringType(), True),
+    StructField("output_details", StringType(), True),
+
+    StructField("trigger_name", StringType(), True),
+    StructField("logged_at", TimestampType(), False)
+])
+
+
+# ============================================================
+# STEP 8: INSERT INTO DELTA TABLE
+# ============================================================
+
+log_df = spark.createDataFrame(
+    log_record,
+    schema=schema
+)
+
+(
+    log_df.write
+    .format("delta")
+    .mode("append")
+    .saveAsTable(LOG_TABLE)
+)
+
+
+# ============================================================
+# STEP 9: RETURN RESULT TO ADF
+# ============================================================
+
+print("ADF activity log inserted successfully")
+print(f"Pipeline       : {pipeline_name}")
+print(f"Activity       : {activity_name}")
+print(f"Status         : {status}")
+print(f"Log table      : {LOG_TABLE}")
+
+dbutils.notebook.exit(
+    json.dumps({
+        "logging_status": "SUCCESS",
+        "pipeline_name": pipeline_name,
+        "activity_name": activity_name,
+        "activity_status": status
+    })
+)
