@@ -4,8 +4,8 @@ WITH base AS (
         attributes,
         `values` AS value,
         CASE
-            WHEN attributes LIKE '%\_1' ESCAPE '\\'
-            THEN LEFT(attributes, LENGTH(attributes) - 2)
+            WHEN RIGHT(attributes, 2) = '_1'
+                THEN LEFT(attributes, LENGTH(attributes) - 2)
             ELSE attributes
         END AS base_attribute
     FROM pivote_df
@@ -15,40 +15,29 @@ paired AS (
     SELECT
         region,
         base_attribute,
-
         MAX(
             CASE
                 WHEN attributes = base_attribute
                 THEN value
             END
-        ) AS original_value,
-
-        MAX(
-            CASE
-                WHEN attributes = CONCAT(base_attribute, '_1')
-                THEN value
-            END
-        ) AS suffixed_value
-
+        ) AS original_value
     FROM base
     GROUP BY region, base_attribute
 )
 
 SELECT
-    region,
-    CASE
-        WHEN original_value IS NOT NULL
-        THEN CONCAT(base_attribute, '_1')
-        ELSE base_attribute
-    END AS attributes,
-
-    CASE
-        WHEN original_value IS NOT NULL
-        THEN suffixed_value
-        ELSE original_value
-    END AS `values`
-
-FROM paired
+    b.region,
+    b.attributes,
+    b.value AS `values`
+FROM base b
+LEFT JOIN paired p
+    ON b.region = p.region
+    AND b.base_attribute = p.base_attribute
 WHERE
-    original_value IS NOT NULL
-    OR suffixed_value IS NOT NULL;
+    -- Keep original attribute only when its value is NOT NULL
+    (b.attributes = b.base_attribute AND p.original_value IS NOT NULL)
+
+    OR
+
+    -- Always keep the _1 record
+    RIGHT(b.attributes, 2) = '_1';
