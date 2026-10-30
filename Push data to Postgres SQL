@@ -1,0 +1,109 @@
+from pyspark.sql import functions as F
+
+# ============================================================
+# STEP 1: CONFIGURATION
+# ============================================================
+
+# Databricks source table
+SOURCE_TABLE = "demo.conformed.school_kpi"
+
+# PostgreSQL configuration
+POSTGRES_HOST = "your-postgres-server.postgres.database.azure.com"
+POSTGRES_PORT = "5432"
+POSTGRES_DATABASE = "reporting_db"
+POSTGRES_SCHEMA = "public"
+POSTGRES_TABLE = "school_kpi"
+
+# PostgreSQL connection URL
+POSTGRES_URL = (
+    f"jdbc:postgresql://{POSTGRES_HOST}:"
+    f"{POSTGRES_PORT}/{POSTGRES_DATABASE}"
+)
+
+# Databricks secret scope and keys
+SECRET_SCOPE = "your-secret-scope"
+
+POSTGRES_USER = dbutils.secrets.get(
+    scope=SECRET_SCOPE,
+    key="postgres-username"
+)
+
+POSTGRES_PASSWORD = dbutils.secrets.get(
+    scope=SECRET_SCOPE,
+    key="postgres-password"
+)
+
+# Write mode: append or overwrite
+WRITE_MODE = "append"
+
+
+# ============================================================
+# STEP 2: READ DATA FROM DATABRICKS TABLE
+# ============================================================
+
+print(f"Reading source table: {SOURCE_TABLE}")
+
+source_df = spark.table(SOURCE_TABLE)
+
+source_count = source_df.count()
+
+print(f"Source record count: {source_count}")
+
+source_df.printSchema()
+
+
+# ============================================================
+# STEP 3: PREPARE POSTGRESQL TARGET
+# ============================================================
+
+# Combine schema and table name
+TARGET_TABLE = f"{POSTGRES_SCHEMA}.{POSTGRES_TABLE}"
+
+# JDBC options
+jdbc_options = {
+    "url": POSTGRES_URL,
+    "dbtable": TARGET_TABLE,
+    "user": POSTGRES_USER,
+    "password": POSTGRES_PASSWORD,
+    "driver": "org.postgresql.Driver",
+    "batchsize": "10000"
+}
+
+
+# ============================================================
+# STEP 4: PUSH DATA TO POSTGRESQL
+# ============================================================
+
+try:
+
+    print(f"Writing data to PostgreSQL table: {TARGET_TABLE}")
+
+    (
+        source_df.write
+        .format("jdbc")
+        .options(**jdbc_options)
+        .mode(WRITE_MODE)
+        .save()
+    )
+
+    print("Data successfully written to PostgreSQL.")
+
+except Exception as e:
+
+    print("Failed to write data to PostgreSQL.")
+    print(f"Error: {str(e)}")
+
+    raise
+
+
+# ============================================================
+# STEP 5: VALIDATE SOURCE RECORD COUNT
+# ============================================================
+
+print("================================================")
+print(f"Source table       : {SOURCE_TABLE}")
+print(f"Target table       : {TARGET_TABLE}")
+print(f"Source record count: {source_count}")
+print(f"Write mode         : {WRITE_MODE}")
+print("Status             : SUCCESS")
+print("================================================")
