@@ -1,0 +1,50 @@
+%pip install Office365-REST-Python-Client;
+
+tenant_id = dbutils.secrets.get(scope="sharepoint_scope", key="tenant_id")
+client_id = dbutils.secrets.get(scope="sharepoint_scope", key="client_id")
+client_secret = dbutils.secrets.get(scope="sharepoint_scope", key="client_secret")
+
+site_url = "https://yourtenant.sharepoint.com/sites/yoursite"
+
+folder_url = "/sites/yoursite/Shared Documents/SourceFiles"
+
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+
+credentials = ClientCredential(client_id, client_secret)
+
+ctx = ClientContext(site_url).with_credentials(credentials)
+
+web = ctx.web.get().execute_query()
+
+print("SharePoint connection established successfully")
+print("Site Title:", web.properties["Title"])
+
+from office365.sharepoint.files.folder import Folder
+
+folder = ctx.web.get_folder_by_server_relative_url(folder_url)
+
+files = folder.files
+ctx.load(files)
+ctx.execute_query()
+
+metadata = []
+
+for file in files:
+
+    file_metadata = {
+        "file_name": file.properties.get("Name"),
+        "file_url": file.properties.get("ServerRelativeUrl"),
+        "file_size": file.properties.get("Length"),
+        "time_created": str(file.properties.get("TimeCreated")),
+        "time_modified": str(file.properties.get("TimeLastModified")),
+        "unique_id": str(file.properties.get("UniqueId"))
+    }
+
+    metadata.append(file_metadata)
+
+print("Total files:", len(metadata))
+
+df = spark.createDataFrame(metadata)
+
+display(df)
