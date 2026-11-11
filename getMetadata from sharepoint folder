@@ -48,3 +48,167 @@ print("Total files:", len(metadata))
 df = spark.createDataFrame(metadata)
 
 display(df)
+
+
+----------------- 
+option 2 
+
+
+from msal import ConfidentialClientApplication
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+import requests
+
+# --------------------------------------------------
+# 1. Service Principal Configuration
+# --------------------------------------------------
+
+client_id = "YOUR_CLIENT_ID"
+tenant_id = "YOUR_TENANT_ID"
+
+authority = f"https://login.microsoftonline.com/{tenant_id}"
+
+# Your PEM certificate
+certificate_pem = """
+-----BEGIN CERTIFICATE-----
+YOUR_PUBLIC_CERTIFICATE
+-----END CERTIFICATE-----
+"""
+
+# Your PEM private key
+private_key = """
+-----BEGIN PRIVATE KEY-----
+YOUR_PRIVATE_KEY
+-----END PRIVATE KEY-----
+"""
+
+# --------------------------------------------------
+# 2. Generate Certificate Thumbprint
+# --------------------------------------------------
+
+certificate = x509.load_pem_x509_certificate(
+    certificate_pem.encode()
+)
+
+cert_thumbprint = certificate.fingerprint(
+    hashes.SHA1()
+).hex().upper()
+
+print("Certificate thumbprint generated")
+
+# --------------------------------------------------
+# 3. Authenticate using MSAL
+# --------------------------------------------------
+
+cert = {
+    "private_key": private_key,
+    "thumbprint": cert_thumbprint
+}
+
+msal_app = ConfidentialClientApplication(
+    client_id=client_id,
+    authority=authority,
+    client_credential=cert
+)
+
+token_result = msal_app.acquire_token_for_client(
+    scopes=["https://graph.microsoft.com/.default"]
+)
+
+if "access_token" not in token_result:
+    raise Exception(token_result.get("error_description"))
+
+access_token = token_result["access_token"]
+
+print("Authentication successful")
+
+# --------------------------------------------------
+# 4. Prepare Graph API Headers
+# --------------------------------------------------
+
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Accept": "application/json"
+}
+
+# --------------------------------------------------
+# 5. Get SharePoint Site ID
+# --------------------------------------------------
+
+hostname = "contoso.sharepoint.com"
+site_path = "/sites/School"
+
+site_url = (
+    f"https://graph.microsoft.com/v1.0/sites/"
+    f"{hostname}:{site_path}"
+)
+
+site_response = requests.get(
+    site_url,
+    headers=headers
+)
+
+site_response.raise_for_status()
+
+site_data = site_response.json()
+
+site_id = site_data["id"]
+
+print("Site ID:", site_id)
+
+# --------------------------------------------------
+# 6. Get Folder Metadata
+# --------------------------------------------------
+
+folder_path = "Reports"
+
+metadata_url = (
+    f"https://graph.microsoft.com/v1.0/sites/"
+    f"{site_id}/drive/root:/{folder_path}:/children"
+)
+
+files_metadata = []
+
+while metadata_url:
+
+    response = requests.get(
+        metadata_url,
+        headers=headers
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    for item in result.get("value", []):
+
+        files_metadata.append({
+            "file_id": item.get("id"),
+            "file_name": item.get("name"),
+            "file_size": item.get("size"),
+            "created_date": item.get("createdDateTime"),
+            "last_modified_date": item.get("lastModifiedDateTime"),
+            "web_url": item.get("webUrl"),
+            "mime_type": item.get("file", {}).get("mimeType"),
+            "download_url": item.get("@microsoft.graph.downloadUrl"),
+            "parent_folder_id": item.get("parentReference", {}).get("id"),
+            "drive_id": item.get("parentReference", {}).get("driveId"),
+            "is_folder": "folder" in item
+        })
+
+    # Handle pagination
+    metadata_url = result.get("@odata.nextLink")
+
+# --------------------------------------------------
+# 7. Convert Metadata into Spark DataFrame
+# --------------------------------------------------
+
+if files_metadata:
+
+    metadata_df = spark.createDataFrame(files_metadata)
+
+    display(metadata_df)
+
+else:
+    print("No files found in the SharePoint folder")
+
