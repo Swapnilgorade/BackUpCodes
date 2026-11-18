@@ -22,3 +22,63 @@ BEGIN
 
 END;
 $$;
+
+--- Shadow code approch
+
+
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_data_refresss()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_staging_count BIGINT;
+    v_shadow_count BIGINT;
+BEGIN
+
+    -- Step 1: Validate staging data
+    SELECT COUNT(*)
+    INTO v_staging_count
+    FROM public.staging_kpi_data_refresss;
+
+    IF v_staging_count = 0 THEN
+        RAISE EXCEPTION 'Staging table is empty. Refresh cancelled.';
+    END IF;
+
+    -- Step 2: Prevent concurrent refresh operations
+    PERFORM pg_advisory_xact_lock(123456789);
+
+    -- Step 3: Create shadow table
+    DROP TABLE IF EXISTS public.kpi_data_refresss_shadow;
+
+    CREATE TABLE public.kpi_data_refresss_shadow
+    (LIKE public.kpi_data_refresss INCLUDING ALL);
+
+    -- Step 4: Load new data into shadow table
+    INSERT INTO public.kpi_data_refresss_shadow
+    SELECT *
+    FROM public.staging_kpi_data_refresss;
+
+    -- Step 5: Validate shadow table
+    SELECT COUNT(*)
+    INTO v_shadow_count
+    FROM public.kpi_data_refresss_shadow;
+
+    IF v_staging_count <> v_shadow_count THEN
+        RAISE EXCEPTION 'Record count mismatch. Refresh cancelled.';
+    END IF;
+
+    -- Step 6: Atomic table switch
+    ALTER TABLE public.kpi_data_refresss
+    RENAME TO kpi_data_refresss_old;
+
+    ALTER TABLE public.kpi_data_refresss_shadow
+    RENAME TO kpi_data_refresss;
+
+    -- Step 7: Drop old table
+    DROP TABLE public.kpi_data_refresss_old;
+
+    RAISE NOTICE 'KPI data refreshed successfully. New records: %',
+    v_shadow_count;
+
+END;
+$$;
+
