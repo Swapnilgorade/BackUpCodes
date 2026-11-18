@@ -1,0 +1,200 @@
+
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_data_refresss()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_staging_count BIGINT;
+    v_inserted_count BIGINT;
+    v_roles TEXT;
+    v_sql TEXT;
+    v_owner TEXT;
+    v_rls_enabled BOOLEAN;
+    v_rls_forced BOOLEAN;
+
+    r_policy RECORD;
+    r_acl RECORD;
+
+BEGIN
+
+    -- 1. Prevent concurrent refresh executions
+    PERFORM pg_advisory_xact_lock(123456789);
+
+    -- 2. Ensure no unfinished previous backup exists
+    IF to_regclass('public.kpi_data_refresss_old') IS NOT NULL THEN
+        RAISE EXCEPTION
+        'Previous backup table exists. Manual verification required.';
+    END IF;
+
+    -- 3. Lock staging against concurrent modifications
+    LOCK TABLE public.staging_kpi_data_refresss
+    IN SHARE MODE;
+
+    -- 4. Validate staging data
+    SELECT COUNT(*)
+    INTO v_staging_count
+    FROM public.staging_kpi_data_refresss;
+
+    IF v_staging_count = 0 THEN
+        RAISE EXCEPTION
+        'Staging is empty. Existing target preserved.';
+    END IF;
+
+    -- 5. Read existing target ownership and RLS settings
+    SELECT
+        pg_get_userbyid(c.relowner),
+        c.relrowsecurity,
+        c.relforcerowsecurity
+    INTO
+        v_owner,
+        v_rls_enabled,
+        v_rls_forced
+    FROM pg_class c
+    WHERE c.oid = 'public.kpi_data_refresss'::regclass;
+
+    -- 6. Remove previous incomplete shadow table
+    DROP TABLE IF EXISTS public.kpi_data_refresss_shadow;
+
+    -- 7. Create shadow table with target structure
+    CREATE TABLE public.kpi_data_refresss_shadow
+    (LIKE public.kpi_data_refresss INCLUDING ALL);
+
+    -- 8. Load new data into shadow table
+    INSERT INTO public.kpi_data_refresss_shadow
+    SELECT *
+    FROM public.staging_kpi_data_refresss;
+
+    GET DIAGNOSTICS v_inserted_count = ROW_COUNT;
+
+    -- 9. Validate inserted records
+    IF v_inserted_count <> v_staging_count THEN
+        RAISE EXCEPTION
+        'Record count mismatch. Staging: %, Inserted: %',
+        v_staging_count, v_inserted_count;
+    END IF;
+
+    -- 10. Dynamically copy existing RLS policies
+    FOR r_policy IN
+        SELECT *
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'kpi_data_refresss'
+    LOOP
+
+        -- Convert policy roles into SQL role list
+        SELECT string_agg(
+            CASE
+                WHEN role_name = 'public' THEN 'PUBLIC'
+                ELSE quote_ident(role_name::text)
+            END,
+            ', '
+        )
+        INTO v_roles
+        FROM unnest(r_policy.roles) AS role_name;
+
+        -- Build policy creation statement
+        v_sql := format(
+            'CREATE POLICY %I
+             ON public.kpi_data_refresss_shadow
+             AS %s
+             FOR %s
+             TO %s',
+            r_policy.policyname,
+            r_policy.permissive,
+            r_policy.cmd,
+            v_roles
+        );
+
+        IF r_policy.qual IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' USING (%s)',
+                r_policy.qual
+            );
+        END IF;
+
+        IF r_policy.with_check IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' WITH CHECK (%s)',
+                r_policy.with_check
+            );
+        END IF;
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 11. Apply existing RLS settings
+    IF v_rls_enabled THEN
+
+        ALTER TABLE public.kpi_data_refresss_shadow
+        ENABLE ROW LEVEL SECURITY;
+
+    END IF;
+
+    IF v_rls_forced THEN
+
+        ALTER TABLE public.kpi_data_refresss_shadow
+        FORCE ROW LEVEL SECURITY;
+
+    END IF;
+
+    -- 12. Copy existing table permissions
+    FOR r_acl IN
+        SELECT
+            acl.grantee,
+            acl.privilege_type,
+            acl.is_grantable
+        FROM pg_class c
+        CROSS JOIN LATERAL
+            aclexplode(
+                COALESCE(
+                    c.relacl,
+                    acldefault('r', c.relowner)
+                )
+            ) AS acl
+        WHERE c.oid = 'public.kpi_data_refresss'::regclass
+    LOOP
+
+        v_roles := CASE
+            WHEN r_acl.grantee = 0 THEN 'PUBLIC'
+            ELSE quote_ident(
+                pg_get_userbyid(r_acl.grantee)
+            )
+        END;
+
+        v_sql := format(
+            'GRANT %s ON TABLE public.kpi_data_refresss_shadow TO %s%s',
+            r_acl.privilege_type,
+            v_roles,
+            CASE
+                WHEN r_acl.is_grantable
+                THEN ' WITH GRANT OPTION'
+                ELSE ''
+            END
+        );
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 13. Preserve existing table owner
+    EXECUTE format(
+        'ALTER TABLE public.kpi_data_refresss_shadow OWNER TO %I',
+        v_owner
+    );
+
+    -- 14. Atomic table replacement
+    ALTER TABLE public.kpi_data_refresss
+    RENAME TO kpi_data_refresss_old;
+
+    ALTER TABLE public.kpi_data_refresss_shadow
+    RENAME TO kpi_data_refresss;
+
+    -- 15. Remove old target table
+    DROP TABLE public.kpi_data_refresss_old;
+
+    RAISE NOTICE
+    'KPI refresh successful. New records: %, RLS policies copied.',
+    v_inserted_count;
+
+END;
+$$;
