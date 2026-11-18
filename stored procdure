@@ -1,0 +1,24 @@
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_data_refresss()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    -- Validate staging table
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.staging_kpi_data_refresss
+    ) THEN
+        RAISE EXCEPTION 'Staging table is empty. Refresh cancelled.';
+    END IF;
+
+    -- Replace target data atomically
+    TRUNCATE TABLE public.kpi_data_refresss;
+
+    INSERT INTO public.kpi_data_refresss
+    SELECT *
+    FROM public.staging_kpi_data_refresss;
+
+    RAISE NOTICE 'Target table refreshed successfully';
+
+END;
+$$;
