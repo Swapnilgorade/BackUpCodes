@@ -198,3 +198,277 @@ BEGIN
 
 END;
 $$;
+
+
+
+--------------------------------------------------- v2.0 --------------------------------------------------
+
+
+
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_data(
+    IN p_table_name TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_staging_count BIGINT;
+    v_inserted_count BIGINT;
+
+    v_target TEXT;
+    v_staging TEXT;
+    v_shadow TEXT;
+    v_old TEXT;
+
+    v_owner TEXT;
+    v_roles TEXT;
+    v_sql TEXT;
+
+    v_rls_enabled BOOLEAN;
+    v_rls_forced BOOLEAN;
+
+    r_policy RECORD;
+    r_acl RECORD;
+
+BEGIN
+
+    -- 1. Validate table name
+    IF p_table_name IS NULL
+       OR p_table_name = ''
+       OR p_table_name !~ '^[a-zA-Z_][a-zA-Z0-9_]*$'
+    THEN
+        RAISE EXCEPTION 'Invalid table name: %', p_table_name;
+    END IF;
+
+    -- 2. Generate dynamic table names
+    v_target  := format('%I.%I', 'public', p_table_name);
+    v_staging := format('%I.%I', 'staging', p_table_name);
+
+    v_shadow := format(
+        '%I.%I',
+        'public',
+        p_table_name || '_shadow'
+    );
+
+    v_old := format(
+        '%I.%I',
+        'public',
+        p_table_name || '_old'
+    );
+
+    -- 3. Prevent concurrent refresh executions
+    PERFORM pg_advisory_xact_lock(
+        hashtext(v_target)::BIGINT
+    );
+
+    -- 4. Validate target table
+    IF to_regclass(v_target) IS NULL THEN
+        RAISE EXCEPTION 'Target table % does not exist', v_target;
+    END IF;
+
+    -- 5. Validate staging table
+    IF to_regclass(v_staging) IS NULL THEN
+        RAISE EXCEPTION 'Staging table % does not exist', v_staging;
+    END IF;
+
+    -- 6. Ensure no unfinished backup exists
+    IF to_regclass(v_old) IS NOT NULL THEN
+        RAISE EXCEPTION
+        'Previous backup table % exists. Manual verification required.',
+        v_old;
+    END IF;
+
+    -- 7. Lock staging table
+    EXECUTE format(
+        'LOCK TABLE %s IN SHARE MODE',
+        v_staging
+    );
+
+    -- 8. Validate staging records
+    EXECUTE format(
+        'SELECT COUNT(*) FROM %s',
+        v_staging
+    )
+    INTO v_staging_count;
+
+    IF v_staging_count = 0 THEN
+        RAISE EXCEPTION
+        'Staging table % is empty. Existing target preserved.',
+        v_staging;
+    END IF;
+
+    -- 9. Capture target ownership and RLS settings
+    SELECT
+        pg_get_userbyid(c.relowner),
+        c.relrowsecurity,
+        c.relforcerowsecurity
+    INTO
+        v_owner,
+        v_rls_enabled,
+        v_rls_forced
+    FROM pg_class c
+    WHERE c.oid = to_regclass(v_target);
+
+    -- 10. Remove previous incomplete shadow table
+    EXECUTE format(
+        'DROP TABLE IF EXISTS %s CASCADE',
+        v_shadow
+    );
+
+    -- 11. Create shadow table using target structure
+    EXECUTE format(
+        'CREATE TABLE %s (LIKE %s INCLUDING ALL)',
+        v_shadow,
+        v_target
+    );
+
+    -- 12. Load staging data into shadow table
+    EXECUTE format(
+        'INSERT INTO %s SELECT * FROM %s',
+        v_shadow,
+        v_staging
+    );
+
+    GET DIAGNOSTICS v_inserted_count = ROW_COUNT;
+
+    -- 13. Validate inserted records
+    IF v_inserted_count <> v_staging_count THEN
+        RAISE EXCEPTION
+        'Record count mismatch. Staging: %, Inserted: %',
+        v_staging_count,
+        v_inserted_count;
+    END IF;
+
+    -- 14. Copy existing RLS policies
+    FOR r_policy IN
+        SELECT *
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = p_table_name
+    LOOP
+
+        SELECT string_agg(
+            CASE
+                WHEN role_name = 'public' THEN 'PUBLIC'
+                ELSE quote_ident(role_name::TEXT)
+            END,
+            ', '
+        )
+        INTO v_roles
+        FROM unnest(r_policy.roles) AS x(role_name);
+
+        v_sql := format(
+            'CREATE POLICY %I ON %s AS %s FOR %s TO %s',
+            r_policy.policyname,
+            v_shadow,
+            r_policy.permissive,
+            r_policy.cmd,
+            v_roles
+        );
+
+        IF r_policy.qual IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' USING (%s)',
+                r_policy.qual
+            );
+        END IF;
+
+        IF r_policy.with_check IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' WITH CHECK (%s)',
+                r_policy.with_check
+            );
+        END IF;
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 15. Apply RLS settings
+    IF v_rls_enabled THEN
+        EXECUTE format(
+            'ALTER TABLE %s ENABLE ROW LEVEL SECURITY',
+            v_shadow
+        );
+    END IF;
+
+    IF v_rls_forced THEN
+        EXECUTE format(
+            'ALTER TABLE %s FORCE ROW LEVEL SECURITY',
+            v_shadow
+        );
+    END IF;
+
+    -- 16. Copy existing table permissions
+    FOR r_acl IN
+        SELECT
+            acl.grantee,
+            acl.privilege_type,
+            acl.is_grantable
+        FROM pg_class c
+        CROSS JOIN LATERAL
+            aclexplode(
+                COALESCE(
+                    c.relacl,
+                    acldefault('r', c.relowner)
+                )
+            ) AS acl
+        WHERE c.oid = to_regclass(v_target)
+    LOOP
+
+        v_roles := CASE
+            WHEN r_acl.grantee = 0 THEN 'PUBLIC'
+            ELSE quote_ident(
+                pg_get_userbyid(r_acl.grantee)
+            )
+        END;
+
+        v_sql := format(
+            'GRANT %s ON TABLE %s TO %s%s',
+            r_acl.privilege_type,
+            v_shadow,
+            v_roles,
+            CASE
+                WHEN r_acl.is_grantable
+                THEN ' WITH GRANT OPTION'
+                ELSE ''
+            END
+        );
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 17. Preserve table owner
+    EXECUTE format(
+        'ALTER TABLE %s OWNER TO %I',
+        v_shadow,
+        v_owner
+    );
+
+    -- 18. Atomic table replacement
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        v_target,
+        p_table_name || '_old'
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        v_shadow,
+        p_table_name
+    );
+
+    -- 19. Remove previous target
+    EXECUTE format(
+        'DROP TABLE %s',
+        v_old
+    );
+
+    -- 20. Refresh successful
+    RAISE NOTICE
+    'Refresh successful: Table %, Records loaded: %',
+    p_table_name,
+    v_inserted_count;
+
+END;
+$$;
