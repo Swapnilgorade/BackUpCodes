@@ -867,4 +867,346 @@ My recommendation for your Databricks → PostgreSQL architecture: If preserving
 
 
 
+----------------- v4
+
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_data_refresss()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_staging_count BIGINT;
+    v_inserted_count BIGINT;
+
+    v_roles TEXT;
+    v_sql TEXT;
+    v_column_list TEXT;
+    v_owner TEXT;
+
+    v_rls_enabled BOOLEAN;
+    v_rls_forced BOOLEAN;
+
+    v_target_index_count BIGINT;
+    v_shadow_index_count BIGINT;
+
+    r_policy RECORD;
+    r_acl RECORD;
+
+BEGIN
+
+    -- 1. Prevent concurrent refresh executions
+    PERFORM pg_advisory_xact_lock(123456789);
+
+    -- 2. Check unfinished previous backup
+    IF to_regclass('public.kpi_data_refresss_old') IS NOT NULL THEN
+        RAISE EXCEPTION
+        'Previous backup table exists. Manual verification required.';
+    END IF;
+
+    -- 3. Lock staging against concurrent modifications
+    LOCK TABLE public.staging_kpi_data_refresss
+    IN SHARE MODE;
+
+    -- 4. Validate staging data
+    SELECT COUNT(*)
+    INTO v_staging_count
+    FROM public.staging_kpi_data_refresss;
+
+    IF v_staging_count = 0 THEN
+        RAISE EXCEPTION
+        'Staging is empty. Existing target preserved.';
+    END IF;
+
+    -- 5. Read target ownership and RLS settings
+    SELECT
+        pg_get_userbyid(c.relowner),
+        c.relrowsecurity,
+        c.relforcerowsecurity
+    INTO
+        v_owner,
+        v_rls_enabled,
+        v_rls_forced
+    FROM pg_class c
+    WHERE c.oid = 'public.kpi_data_refresss'::regclass;
+
+    -- 6. Remove previous incomplete shadow table
+    IF to_regclass('public.kpi_data_refresss_shadow') IS NOT NULL THEN
+        DROP TABLE public.kpi_data_refresss_shadow;
+    END IF;
+
+    -- 7. Create shadow table with target structure and indexes
+    CREATE TABLE public.kpi_data_refresss_shadow
+    (LIKE public.kpi_data_refresss INCLUDING ALL);
+
+    -- 8. Dynamic column mapping
+    -- Match columns by name, not column position
+    -- Skip identity and generated columns
+
+    SELECT string_agg(
+        format('%I', t.column_name),
+        ', ' ORDER BY t.ordinal_position
+    )
+    INTO v_column_list
+    FROM information_schema.columns t
+    INNER JOIN information_schema.columns s
+        ON t.column_name = s.column_name
+    WHERE t.table_schema = 'public'
+      AND t.table_name = 'kpi_data_refresss'
+      AND s.table_schema = 'public'
+      AND s.table_name = 'staging_kpi_data_refresss'
+      AND t.is_generated = 'NEVER'
+      AND t.is_identity = 'NO';
+
+    IF v_column_list IS NULL THEN
+        RAISE EXCEPTION
+        'No matching columns found between staging and target.';
+    END IF;
+
+    RAISE NOTICE
+    'Column mapping identified: %',
+    v_column_list;
+
+    -- 9. Insert data using dynamic column mapping
+
+    v_sql := format(
+        'INSERT INTO public.kpi_data_refresss_shadow (%1$s)
+         SELECT %1$s
+         FROM public.staging_kpi_data_refresss',
+        v_column_list
+    );
+
+    EXECUTE v_sql;
+
+    GET DIAGNOSTICS v_inserted_count = ROW_COUNT;
+
+    -- 10. Validate inserted records
+
+    IF v_inserted_count <> v_staging_count THEN
+        RAISE EXCEPTION
+        'Record count mismatch. Staging: %, Inserted: %',
+        v_staging_count, v_inserted_count;
+    END IF;
+
+    RAISE NOTICE
+    'Record validation successful. Records inserted: %',
+    v_inserted_count;
+
+    -- 11. Validate target and shadow indexes
+    -- Compare actual index definitions, not only index counts
+
+    SELECT COUNT(*)
+    INTO v_target_index_count
+    FROM pg_index
+    WHERE indrelid = 'public.kpi_data_refresss'::regclass;
+
+    SELECT COUNT(*)
+    INTO v_shadow_index_count
+    FROM pg_index
+    WHERE indrelid = 'public.kpi_data_refresss_shadow'::regclass;
+
+    IF v_target_index_count <> v_shadow_index_count THEN
+        RAISE EXCEPTION
+        'Index count mismatch. Target: %, Shadow: %',
+        v_target_index_count, v_shadow_index_count;
+    END IF;
+
+    -- Compare index definitions
+    IF EXISTS (
+        WITH target_indexes AS (
+            SELECT
+                am.amname,
+                i.indisunique,
+                i.indisprimary,
+                i.indisexclusion,
+                i.indimmediate,
+                i.indisvalid,
+                i.indisready,
+                i.indnatts,
+                i.indkey::text AS indkey,
+                i.indclass::text AS indclass,
+                i.indcollation::text AS indcollation,
+                i.indoption::text AS indoption,
+                pg_get_expr(i.indpred, i.indrelid) AS predicate,
+                pg_get_expr(i.indexprs, i.indrelid) AS expressions
+            FROM pg_index i
+            JOIN pg_class idx
+                ON idx.oid = i.indexrelid
+            JOIN pg_am am
+                ON am.oid = idx.relam
+            WHERE i.indrelid =
+                'public.kpi_data_refresss'::regclass
+        ),
+        shadow_indexes AS (
+            SELECT
+                am.amname,
+                i.indisunique,
+                i.indisprimary,
+                i.indisexclusion,
+                i.indimmediate,
+                i.indisvalid,
+                i.indisready,
+                i.indnatts,
+                i.indkey::text AS indkey,
+                i.indclass::text AS indclass,
+                i.indcollation::text AS indcollation,
+                i.indoption::text AS indoption,
+                pg_get_expr(i.indpred, i.indrelid) AS predicate,
+                pg_get_expr(i.indexprs, i.indrelid) AS expressions
+            FROM pg_index i
+            JOIN pg_class idx
+                ON idx.oid = i.indexrelid
+            JOIN pg_am am
+                ON am.oid = idx.relam
+            WHERE i.indrelid =
+                'public.kpi_data_refresss_shadow'::regclass
+        )
+        SELECT 1
+        FROM (
+            (
+                SELECT * FROM target_indexes
+                EXCEPT ALL
+                SELECT * FROM shadow_indexes
+            )
+            UNION ALL
+            (
+                SELECT * FROM shadow_indexes
+                EXCEPT ALL
+                SELECT * FROM target_indexes
+            )
+        ) differences
+        LIMIT 1
+    ) THEN
+        RAISE EXCEPTION
+        'Index definition mismatch between target and shadow table.';
+    END IF;
+
+    RAISE NOTICE
+    'Index validation successful. Total indexes: %',
+    v_shadow_index_count;
+
+    -- 12. Dynamically copy existing RLS policies
+
+    FOR r_policy IN
+        SELECT *
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'kpi_data_refresss'
+    LOOP
+
+        SELECT string_agg(
+            CASE
+                WHEN role_name = 'public' THEN 'PUBLIC'
+                ELSE quote_ident(role_name::text)
+            END,
+            ', '
+        )
+        INTO v_roles
+        FROM unnest(r_policy.roles) AS role_name;
+
+        v_sql := format(
+            'CREATE POLICY %I
+             ON public.kpi_data_refresss_shadow
+             AS %s
+             FOR %s
+             TO %s',
+            r_policy.policyname,
+            r_policy.permissive,
+            r_policy.cmd,
+            v_roles
+        );
+
+        IF r_policy.qual IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' USING (%s)',
+                r_policy.qual
+            );
+        END IF;
+
+        IF r_policy.with_check IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' WITH CHECK (%s)',
+                r_policy.with_check
+            );
+        END IF;
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 13. Apply existing RLS settings
+
+    IF v_rls_enabled THEN
+        ALTER TABLE public.kpi_data_refresss_shadow
+        ENABLE ROW LEVEL SECURITY;
+    END IF;
+
+    IF v_rls_forced THEN
+        ALTER TABLE public.kpi_data_refresss_shadow
+        FORCE ROW LEVEL SECURITY;
+    END IF;
+
+    -- 14. Copy existing table permissions
+
+    FOR r_acl IN
+        SELECT
+            acl.grantee,
+            acl.privilege_type,
+            acl.is_grantable
+        FROM pg_class c
+        CROSS JOIN LATERAL
+            aclexplode(
+                COALESCE(
+                    c.relacl,
+                    acldefault('r', c.relowner)
+                )
+            ) AS acl
+        WHERE c.oid = 'public.kpi_data_refresss'::regclass
+    LOOP
+
+        v_roles := CASE
+            WHEN r_acl.grantee = 0 THEN 'PUBLIC'
+            ELSE quote_ident(
+                pg_get_userbyid(r_acl.grantee)
+            )
+        END;
+
+        v_sql := format(
+            'GRANT %s ON TABLE public.kpi_data_refresss_shadow TO %s%s',
+            r_acl.privilege_type,
+            v_roles,
+            CASE
+                WHEN r_acl.is_grantable
+                THEN ' WITH GRANT OPTION'
+                ELSE ''
+            END
+        );
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 15. Preserve existing table owner
+
+    EXECUTE format(
+        'ALTER TABLE public.kpi_data_refresss_shadow OWNER TO %I',
+        v_owner
+    );
+
+    -- 16. Atomic table replacement
+
+    ALTER TABLE public.kpi_data_refresss
+    RENAME TO kpi_data_refresss_old;
+
+    ALTER TABLE public.kpi_data_refresss_shadow
+    RENAME TO kpi_data_refresss;
+
+    -- 17. Remove old target table
+
+    DROP TABLE public.kpi_data_refresss_old;
+
+    RAISE NOTICE
+    'KPI refresh successful. Records: %, Indexes: %, RLS policies copied.',
+    v_inserted_count,
+    v_shadow_index_count;
+
+END;
+$$;
 
