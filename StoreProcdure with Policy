@@ -472,3 +472,399 @@ BEGIN
 
 END;
 $$;
+
+
+--------------------V3 -------------------
+
+NO same error column "KPI_Data_refreshness" does not exist
+Okay, now we have identified a different issue. Your tables exist, so the problem is no longer related to schema or table existence.
+
+The error:
+
+column "KPI_Data_refreshness" does not exist
+
+suggests that PostgreSQL is trying to reference KPI_Data_refreshness as a column, but it cannot find that column in the relevant table or query.
+
+One likely issue is that your actual table name is KPI_Data_refreshness, but the procedure is receiving it without the correct case handling.
+
+PostgreSQL treats unquoted identifiers as lowercase. For example:
+
+KPI_Data_refreshness becomes kpi_data_refreshness.
+
+"KPI_Data_refreshness" preserves the uppercase letters.
+
+1. First, execute this
+SELECT
+    table_schema,
+    table_name,
+    column_name
+FROM information_schema.columns
+WHERE table_schema IN ('public', 'staging')
+  AND table_name ILIKE '%KPI_Data_refreshness%'
+ORDER BY table_schema, ordinal_position;
+
+This will show the exact column names and their casing.
+
+2. Check your procedure execution
+If your actual table name is KPI_Data_refreshness, execute:
+
+CALL staging.refresh_table('KPI_Data_refreshness');
+
+Do not execute it without single quotes:
+
+-- Incorrect
+CALL staging.refresh_table(KPI_Data_refreshness);
+
+PostgreSQL interprets an unquoted argument as an identifier rather than a text value.
+
+PostgreSQL's identifier case-sensitivity rules are documented here: PostgreSQL documentation.
+
+3. One thing I need to confirm
+Please share the exact output of these two queries:
+
+SELECT table_schema, table_name
+FROM information_schema.tables
+WHERE table_schema IN ('public', 'staging')
+  AND table_name ILIKE '%KPI_Data_refreshness%';
+
+And:
+
+CALL staging.refresh_table('KPI_Data_refreshness');
+
+Also share the complete error, including the CONTEXT and LINE details if PostgreSQL provides them.
+
+I want to identify exactly where the procedure is failing before changing your refresh logic.
+
+Can you give me full scprit agin
+Absolutely. Below is the complete revised dynamic procedure.
+
+I've made a few important changes:
+
+Procedure is created in the staging schema.
+
+You pass only the table name.
+
+Supports mixed-case table names such as KPI_Data_refreshness.
+
+Uses information_schema.tables for table validation.
+
+Preserves existing RLS settings and policies.
+
+Preserves table ownership and permissions.
+
+Validates staging and inserted record counts.
+
+Uses transactional table replacement.
+
+Important: This version assumes the target and staging tables have matching column structures and column order.
+
+Complete stored procedure
+
+CREATE OR REPLACE PROCEDURE staging.refresh_table(
+    IN p_table_name TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+
+    v_target TEXT;
+    v_staging TEXT;
+    v_shadow TEXT;
+    v_old TEXT;
+
+    v_staging_count BIGINT;
+    v_inserted_count BIGINT;
+
+    v_owner TEXT;
+    v_roles TEXT;
+    v_sql TEXT;
+
+    v_rls_enabled BOOLEAN;
+    v_rls_forced BOOLEAN;
+
+    r_policy RECORD;
+    r_acl RECORD;
+
+BEGIN
+
+    -- 1. Validate input
+    IF p_table_name IS NULL OR TRIM(p_table_name) = '' THEN
+        RAISE EXCEPTION 'Table name cannot be empty';
+    END IF;
+
+    -- 2. Generate dynamic table references
+    v_target := format('%I.%I', 'public', p_table_name);
+    v_staging := format('%I.%I', 'staging', p_table_name);
+
+    v_shadow := format(
+        '%I.%I',
+        'public',
+        p_table_name || '_shadow'
+    );
+
+    v_old := format(
+        '%I.%I',
+        'public',
+        p_table_name || '_old'
+    );
+
+    -- 3. Prevent concurrent execution
+    PERFORM pg_advisory_xact_lock(
+        hashtext(v_target)::BIGINT
+    );
+
+    -- 4. Validate target table
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = p_table_name
+    ) THEN
+        RAISE EXCEPTION 'Target table % does not exist', v_target;
+    END IF;
+
+    -- 5. Validate staging table
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'staging'
+          AND table_name = p_table_name
+    ) THEN
+        RAISE EXCEPTION 'Staging table % does not exist', v_staging;
+    END IF;
+
+    -- 6. Check unfinished backup
+    IF to_regclass(v_old) IS NOT NULL THEN
+        RAISE EXCEPTION
+        'Previous backup % exists. Manual verification required.',
+        v_old;
+    END IF;
+
+    -- 7. Lock staging table
+    EXECUTE format(
+        'LOCK TABLE %s IN SHARE MODE',
+        v_staging
+    );
+
+    -- 8. Count staging records
+    EXECUTE format(
+        'SELECT COUNT(*) FROM %s',
+        v_staging
+    )
+    INTO v_staging_count;
+
+    IF v_staging_count = 0 THEN
+        RAISE EXCEPTION
+        'Staging table is empty. Existing target preserved.';
+    END IF;
+
+    -- 9. Capture existing target settings
+    SELECT
+        pg_get_userbyid(c.relowner),
+        c.relrowsecurity,
+        c.relforcerowsecurity
+    INTO
+        v_owner,
+        v_rls_enabled,
+        v_rls_forced
+    FROM pg_class c
+    WHERE c.oid = to_regclass(v_target);
+
+    -- 10. Remove previous incomplete shadow table
+    EXECUTE format(
+        'DROP TABLE IF EXISTS %s CASCADE',
+        v_shadow
+    );
+
+    -- 11. Create shadow table
+    EXECUTE format(
+        'CREATE TABLE %s (LIKE %s INCLUDING ALL)',
+        v_shadow,
+        v_target
+    );
+
+    -- 12. Insert staging data
+    EXECUTE format(
+        'INSERT INTO %s SELECT * FROM %s',
+        v_shadow,
+        v_staging
+    );
+
+    GET DIAGNOSTICS v_inserted_count = ROW_COUNT;
+
+    -- 13. Validate record count
+    IF v_inserted_count <> v_staging_count THEN
+        RAISE EXCEPTION
+        'Record mismatch. Staging: %, Inserted: %',
+        v_staging_count,
+        v_inserted_count;
+    END IF;
+
+    -- 14. Copy RLS policies
+    FOR r_policy IN
+        SELECT *
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = p_table_name
+    LOOP
+
+        SELECT string_agg(
+            CASE
+                WHEN role_name = 'public' THEN 'PUBLIC'
+                ELSE quote_ident(role_name::TEXT)
+            END,
+            ', '
+        )
+        INTO v_roles
+        FROM unnest(r_policy.roles) AS x(role_name);
+
+        v_sql := format(
+            'CREATE POLICY %I ON %s AS %s FOR %s TO %s',
+            r_policy.policyname,
+            v_shadow,
+            r_policy.permissive,
+            r_policy.cmd,
+            v_roles
+        );
+
+        IF r_policy.qual IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' USING (%s)',
+                r_policy.qual
+            );
+        END IF;
+
+        IF r_policy.with_check IS NOT NULL THEN
+            v_sql := v_sql || format(
+                ' WITH CHECK (%s)',
+                r_policy.with_check
+            );
+        END IF;
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 15. Apply RLS settings
+    IF v_rls_enabled THEN
+        EXECUTE format(
+            'ALTER TABLE %s ENABLE ROW LEVEL SECURITY',
+            v_shadow
+        );
+    END IF;
+
+    IF v_rls_forced THEN
+        EXECUTE format(
+            'ALTER TABLE %s FORCE ROW LEVEL SECURITY',
+            v_shadow
+        );
+    END IF;
+
+    -- 16. Copy existing permissions
+    FOR r_acl IN
+        SELECT
+            acl.grantee,
+            acl.privilege_type,
+            acl.is_grantable
+        FROM pg_class c
+        CROSS JOIN LATERAL
+            aclexplode(
+                COALESCE(
+                    c.relacl,
+                    acldefault('r', c.relowner)
+                )
+            ) AS acl
+        WHERE c.oid = to_regclass(v_target)
+    LOOP
+
+        v_roles := CASE
+            WHEN r_acl.grantee = 0 THEN 'PUBLIC'
+            ELSE quote_ident(
+                pg_get_userbyid(r_acl.grantee)
+            )
+        END;
+
+        v_sql := format(
+            'GRANT %s ON TABLE %s TO %s%s',
+            r_acl.privilege_type,
+            v_shadow,
+            v_roles,
+            CASE
+                WHEN r_acl.is_grantable
+                THEN ' WITH GRANT OPTION'
+                ELSE ''
+            END
+        );
+
+        EXECUTE v_sql;
+
+    END LOOP;
+
+    -- 17. Preserve existing owner
+    EXECUTE format(
+        'ALTER TABLE %s OWNER TO %I',
+        v_shadow,
+        v_owner
+    );
+
+    -- 18. Rename existing target
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        v_target,
+        p_table_name || '_old'
+    );
+
+    -- 19. Rename shadow to target
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        v_shadow,
+        p_table_name
+    );
+
+    -- 20. Drop old table
+    EXECUTE format(
+        'DROP TABLE %s',
+        v_old
+    );
+
+    -- 21. Success message
+    RAISE NOTICE
+    'Refresh successful. Table: %, Records loaded: %',
+    p_table_name,
+    v_inserted_count;
+
+END;
+$$;
+
+Execute the procedure
+For your KPI table:
+
+CALL staging.refresh_table('KPI_Data_refreshness');
+
+Verify the refreshed table
+SELECT COUNT(*)
+FROM public."KPI_Data_refreshness";
+
+Important production warning
+I want to highlight one architectural concern before you deploy this.
+
+Your current approach uses shadow-table replacement. Although RLS policies, ownership and grants are recreated, this does not automatically preserve all dependencies such as:
+
+Foreign keys referencing the original table.
+
+Triggers.
+
+Views and materialized views.
+
+Other objects depending on the original table OID.
+
+Sequence ownership and associated dependencies.
+
+Also, DROP TABLE ... CASCADE on the shadow table can remove dependent objects.
+
+My recommendation for your Databricks → PostgreSQL architecture: If preserving the existing table, RLS, views and dependencies is mandatory, use an in-place DELETE + INSERT transaction instead. That is generally safer for your reporting tables, although it requires careful transaction and RLS handling.
+
+
+
+
+
