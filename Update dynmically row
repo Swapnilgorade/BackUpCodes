@@ -1,0 +1,31 @@
+
+CREATE OR REPLACE PROCEDURE public.refresh_kpi_modified_date(
+    IN p_kpi_names TEXT[]
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_kpi TEXT;
+BEGIN
+
+    FOREACH v_kpi IN ARRAY p_kpi_names
+    LOOP
+
+        INSERT INTO public.kpi_data (
+            kpi_name,
+            last_modified_date
+        )
+        VALUES (
+            v_kpi,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (kpi_name)
+        DO UPDATE
+        SET last_modified_date = CURRENT_TIMESTAMP;
+
+        RAISE NOTICE 'KPI processed: %', v_kpi;
+
+    END LOOP;
+
+END;
+$$;
