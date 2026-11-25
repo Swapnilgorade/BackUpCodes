@@ -29,3 +29,14 @@ BEGIN
 
 END;
 $$;
+
+@concat(
+    'CALL public.refresh_kpi_modified_date(',
+    'ARRAY[''',
+    join(pipeline().parameters.p_kpi_names, ''','''),
+    '''], ',
+    '''',
+    pipeline().parameters.p_last_modified_date,
+    '''::TIMESTAMP',
+    ');'
+)
